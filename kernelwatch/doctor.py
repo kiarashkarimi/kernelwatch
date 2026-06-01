@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import List
+from typing import List, Optional
+from collections import defaultdict
+import json
+import sys
 
 from rich.table import Table
 
@@ -11,10 +14,50 @@ from .pacman import check_pacman_db, check_package_integrity
 from .services import check_failed_services
 from .logs import get_kernel_errors
 
+SEVERITY_WEIGHT = {
+    "OK": 0,
+    "INFO": 1,
+    "WARN": 3,
+    "CRITICAL": 6,
+}
+
+def filter_events(events, min_level=None):
+    order = {
+        "OK": 0,
+        "INFO": 1,
+        "WARN": 2,
+        "CRITICAL": 3,
+    }
+
+    if not min_level:
+        return events
+
+    return [
+        e for e in events
+        if order[e.severity.value] >= order[min_level]
+    ]
+
+def events_to_json(events):
+    return [
+        {
+            "section": e.section,
+            "severity": e.severity.value,
+            "message": e.message,
+            "code": e.code,
+        }
+        for e in events
+    ]
+
+def compute_health_score(events):
+    score = 100
+
+    for e in events:
+        score -= SEVERITY_WEIGHT[e.severity.value]
+
+    return max(score, 0)
+
 # ----------------------------
-
-# Severity Model
-
+# Event Model
 # ----------------------------
 
 class Severity(Enum):
@@ -23,32 +66,103 @@ class Severity(Enum):
     WARN = "WARN"
     CRITICAL = "CRITICAL"
 
+
 @dataclass
-class Diagnostic:
+
+class Event:
+
     section: str
-    message: str
     severity: Severity
+    message: str
+    code: Optional[str] = None
+
+
+# ----------------------------
+# Context Collector
+# ----------------------------
+
+def collect_context():
+    import os
+    from .kernel import get_running_kernel
+
+    bootloader = None
+
+    if os.path.exists("/boot/loader"):
+        bootloader = "systemd-boot"
+    elif os.path.exists("/boot/grub"):
+        bootloader = "grub"
+
+    return {
+        "kernel": get_running_kernel(),
+        "bootloader": bootloader,
+    }
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def make(section, severity, message, code=None):
+    return Event(section, severity, message, code)
+
+
+def ok(section, message):
+    return make(section, Severity.OK, message)
+
+
+def warn(section, message, code=None):
+    return make(section, Severity.WARN, message, code)
+
+
+def critical(section, message, code=None):
+    return make(section, Severity.CRITICAL, message, code)
+
+
+def info(section, message):
+    return make(section, Severity.INFO, message)
+
+
+# ----------------------------
+# Boot Rule Layer
+# ----------------------------
+
+def evaluate_boot(init_ok: bool, msg: str, ctx):
+    if init_ok:
+        return ok("boot", msg)
+
+    if ctx["bootloader"] is None:
+        return critical("boot", msg)
+
+    return warn("boot", msg)
+
 
 # ----------------------------
 
-# Rule Engine Helpers
+# Log Clustering (embedded)
 
 # ----------------------------
 
-def make(section: str, message: str, severity: Severity):
-    return Diagnostic(section, message, severity)
 
-def ok(section: str, message: str):
-    return make(section, message, Severity.OK)
+def cluster_logs(lines: List[str], limit: int = 5) -> List[str]:
+    freq = defaultdict(int)
 
-def warn(section: str, message: str):
-    return make(section, message, Severity.WARN)
+    for line in lines:
+        parts = line.split()
 
-def critical(section: str, message: str):
-    return make(section, message, Severity.CRITICAL)
+        # strip timestamp if present
+        cleaned = line.split("kernel:", 1)[-1] if "kernel:" in line else line
+        freq[cleaned] += 1
 
-def info(section: str, message: str):
-    return make(section, message, Severity.INFO)
+    clustered = []
+
+    for msg, count in sorted(freq.items(), key=lambda x: -x[1]):
+        if count > 1:
+            clustered.append(f"{msg} (x{count})")
+        else:
+            clustered.append(msg)
+
+    return clustered[:limit]
+
 
 # ----------------------------
 
@@ -56,56 +170,44 @@ def info(section: str, message: str):
 
 # ----------------------------
 
-def run_diagnostics() -> List[Diagnostic]:
-    results: List[Diagnostic] = []
+def run_diagnostics() -> List[Event]:
+    results: List[Event] = []
+    ctx = collect_context()
 
     # ---------------- Kernel ----------------
     kernel = get_running_kernel()
     results.append(ok("kernel", f"Running kernel: {kernel}"))
 
     installed = get_installed_kernels()
-    results.append(info("kernel", f"Installed kernels: {', '.join(installed) if installed else 'none'}"))
+    results.append(info(
+        "kernel",
+        f"Installed kernels: {', '.join(installed) if installed else 'none'}"
+    ))
 
     # ---------------- Boot ----------------
-
-    ok_init, initramfs_msg = check_initramfs()
-
-    if ok_init:
-        results.append(ok("boot", initramfs_msg))
-    else:
-        # downgrade to WARN unless system is clearly broken
-        ok_boot, _ = check_bootloader()
-        ok_entries, _ = check_boot_entries()
-
-        if ok_boot or ok_entries:
-            results.append(warn("boot", initramfs_msg))
-        else:
-            results.append(critical("boot", initramfs_msg))
+    ok_init, init_msg = check_initramfs()
+    results.append(evaluate_boot(ok_init, init_msg, ctx))
 
     ok_boot, bootloader = check_bootloader()
-    if ok_boot:
-        results.append(ok("boot", bootloader))
-    else:
-        results.append(warn("boot", bootloader))
+    results.append(
+        ok("boot", bootloader) if ok_boot else warn("boot", bootloader)
+    )
 
     ok_entries, entries = check_boot_entries()
-    if ok_entries:
-        results.append(ok("boot", entries))
-    else:
-        results.append(warn("boot", entries))
+    results.append(
+        ok("boot", entries) if ok_entries else warn("boot", entries)
+    )
 
     # ---------------- Pacman ----------------
     ok_db, db = check_pacman_db()
-    if ok_db:
-        results.append(ok("pacman", "Database clean"))
-    else:
-        results.append(warn("pacman", db))
+    results.append(
+        ok("pacman", "Database clean") if ok_db else warn("pacman", db)
+    )
 
     ok_pkg, pkg = check_package_integrity()
-    if ok_pkg:
-        results.append(ok("pacman", "Package integrity OK"))
-    else:
-        results.append(warn("pacman", pkg))
+    results.append(
+        ok("pacman", "Package integrity OK") if ok_pkg else warn("pacman", pkg)
+    )
 
     # ---------------- Services ----------------
     ok_svc, failed = check_failed_services()
@@ -116,12 +218,13 @@ def run_diagnostics() -> List[Diagnostic]:
     else:
         results.append(ok("systemd", "No failed services"))
 
-    # ---------------- Kernel Logs ----------------
+    # ---------------- Kernel Logs (clustered) ----------------
     ok_logs, logs = get_kernel_errors()
 
     if ok_logs and logs:
-        lines = logs.splitlines()[:5]
-        for line in lines:
+        clustered = cluster_logs(logs.splitlines())
+
+        for line in clustered:
             results.append(warn("kernel-log", line))
     else:
         results.append(ok("kernel-log", "No critical kernel errors"))
@@ -130,22 +233,16 @@ def run_diagnostics() -> List[Diagnostic]:
 
 
 # ----------------------------
-
-# Severity Aggregation
-
+# Aggregation
 # ----------------------------
 
-def summarize(results: List[Diagnostic]):
-    summary = {
-        "OK": 0,
-        "INFO": 0,
-        "WARN": 0,
-        "CRITICAL": 0,
-    }
+def summarize(events: List[Event]):
+    summary = {s.value: 0 for s in Severity}
 
+    for event in events:
+        summary[event.severity.value] += 1
 
-    for r in results:
-        summary[r.severity.value] += 1
+    summary["HEALTH_SCORE"] = compute_health_score(events)
 
     return summary
 
@@ -157,13 +254,15 @@ def overall_status(summary):
         return "WARN"
     return "OK"
 
-# ----------------------------
-
-# Renderer (CLI output)
 
 # ----------------------------
 
-def render(results: List[Diagnostic]):
+# Renderer
+
+# ----------------------------
+
+def render(events: List[Event]):
+
     table = Table(title="kernelwatch diagnostic report")
 
 
@@ -171,18 +270,20 @@ def render(results: List[Diagnostic]):
     table.add_column("Severity")
     table.add_column("Message")
 
-    for r in results:
-        color = {
-            "OK": "green",
-            "INFO": "blue",
-            "WARN": "yellow",
-            "CRITICAL": "red",
-        }[r.severity.value]
+    color_map = {
+        "OK": "green",
+        "INFO": "blue",
+        "WARN": "yellow",
+        "CRITICAL": "red",
+    }
+
+    for e in events:
+        color = color_map[e.severity.value]
 
         table.add_row(
-            r.section,
-            f"[{color}]{r.severity.value}[/{color}]",
-            r.message,
+            e.section,
+            f"[{color}]{e.severity.value}[/{color}]",
+            e.message,
         )
 
     console.print(table)
@@ -194,14 +295,63 @@ def render(results: List[Diagnostic]):
 
 # ----------------------------
 
-def doctor():
-    results = run_diagnostics()
-    summary = summarize(results)
+def doctor(output: str = "table", min_level: str | None = None):
+    events = run_diagnostics()
 
+    # -----------------------------
+    # Optional severity filtering
+    # -----------------------------
+    if min_level:
+        order = {
+            "OK": 0,
+            "INFO": 1,
+            "WARN": 2,
+            "CRITICAL": 3,
+        }
 
-    render(results)
+        events = [
+            e for e in events
+            if order[e.severity.value] >= order[min_level]
+        ]
+
+    # -----------------------------
+    # Summary + score
+    # -----------------------------
+    summary = summarize(events)
+    score = summary["HEALTH_SCORE"]
+
+    # -----------------------------
+    # JSON output mode
+    # -----------------------------
+    if output == "json":
+        import json
+
+        print(json.dumps({
+            "summary": summary,
+            "health_score": score,
+            "status": overall_status(summary),
+            "events": [
+                {
+                    "section": e.section,
+                    "severity": e.severity.value,
+                    "message": e.message,
+                    "code": e.code,
+                }
+                for e in events
+            ],
+        }, indent=2))
+        return
+
+    # -----------------------------
+    # Human-readable output
+    # -----------------------------
+    render(events)
 
     console.print("\n[bold]Summary:[/bold]")
     console.print(summary)
-    console.print(f"[bold]Overall status:[/bold] {overall_status(summary)}")
 
+    console.print(f"[bold]Health Score:[/bold] {score}/100")
+    console.print(f"[bold]Overall Status:[/bold] {overall_status(summary)}")
+
+
+# ----------------------------
